@@ -1,0 +1,746 @@
+---
+title: "SNCF"
+author: "Logical Foundation"
+date: "1/7/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(lubridate)
+library(tidyverse)
+library(car)
+library(pander)
+library(sjPlot)
+```
+
+Today I wanted to take advantage of publicly available SNCF customer satisfaction survey to illustrate how Data Science can be important for such simple managerial decisions as investment in simple amenities.
+The data is the courtesy of [SNCF.](https://ressources.data.sncf.com/explore/?sort=modified)
+
+
+## Importing and cleaning the data
+
+The main challenge of this seemingly simple project was a vast amount of different files that had to be cleaned and combined together before the data analysis could even start. Data preparation is one of the unseen parts of Data Scientist's job, this hidden part of the iceberg.
+
+So, first we import the main file that summarizes the train stations and customer satisfaction in each, both for arriving and departing passengers.
+
+![SNCF customer satisfaction survey ](SNCF_data_1.png)
+
+![SNCF customer satisfaction survey (cont) ](SNCF_data_2.png)
+
+![SNCF customer satisfaction survey (cont) ](SNCF_data_3.png)
+
+
+![SNCF customer satisfaction survey (cont) ](SNCF_data_4.png)
+
+![SNCF customer satisfaction survey (cont) ](SNCF_data_5.png)
+
+To save you from the boredom, I leave the conversion of this (heavily graphical and full of special characters) Excel file behind the scope of this article and we'll skip to importing the cleaned-up csv version of the file instead. I also shorten up the names of the columns to save myself some typing. And I convert the numeric columns to be treated as such (yes, with for-cycle, because I'm old-school).
+
+```{r import1, echo=TRUE}
+df1 <- read.csv("SNCF_Synthesis.csv", sep = ";", dec = ".", header = TRUE, stringsAsFactors = FALSE)
+
+df1[1,2] <- "Type" #rename some of the header
+df1[1,3] <- "Service"
+df1[1,4] <- "UIC"
+df1[1,6] <- "Works"
+
+colnames(df1) <- df1[1,]
+df1 <- df1[-1,] #remove old column names in a row
+
+#convert cols 7 to 24 to numeric
+for (i.seq in seq(from = 7, to = (ncol(df1)-1))){
+  df1[,i.seq] <- as.numeric(df1[,i.seq])
+}
+
+y <- c(1, 2, 3, 4, 6, 25)
+for (i.seq in y){
+  df1[,i.seq] <- factor(df1[,i.seq])
+}
+```
+
+Finally, I convert the rest to factor variables, and the first part of input data is ready.
+
+Next, I import the file containing cleanliness rating of the stations. I only keep the important columns, rename them and convert them to factors or numbers as needed. Next, I drop the old observations, only keeping the ones that correspond to the time period of the other satisfaction survey, i.e. March.
+
+```{r import 2, echo=TRUE}
+df_prop <- read.csv("proprete-en-gare.csv", sep = ";", 
+                  dec = ".", header = TRUE, stringsAsFactors = FALSE)
+df_prop <- df_prop[,c(1,2,3,6)]
+colnames(df_prop) <- c("Month", "UIC", "Gare", "Conformity")
+
+df_prop[,1] <- factor(df_prop[,1])
+df_prop[,2] <- factor(df_prop[,2])
+
+y <- df_prop %>%
+  group_by(Month) %>%
+  summarise(meanconf = mean(Conformity))
+tail(y)
+
+df_prop_mars <- df_prop %>%
+  filter(Month == "2019-03")
+
+some(df_prop_mars)
+```
+
+This could be pretty straightforward, but the Unique ID of the train station is not in the same format as in the other file, so we drop the first two digits. Also, there's apparently a doublon that needs to be found and eliminated. 
+
+``` {r import 3, echo = TRUE}
+df_prop_mars <- df_prop_mars[,c(2,4)]
+df_prop_mars$UIC <- factor((as.numeric(as.character(df_prop_mars$UIC))-87000000))
+ 
+# it contains a doublon, we're looking for it
+z <- df_prop_mars %>%
+  group_by(UIC) %>%
+  summarize(count = n())
+
+y <- z[which(z$count > 1),1]
+y
+```
+Next, we figure out which are the lines showing information for the station above twice, and delete one of them.
+
+``` {r import 4, echo = TRUE}
+which(df_prop_mars$UIC == "271007")
+```
+
+
+``` {r import 5, echo = TRUE}
+df_prop_mars <- df_prop_mars[-6,]
+```
+
+As a next step, I import the data on various facilities installed in the train stations that SNCF proudly shares: pianos, telephone charging stations, magazine vending machines and so forth. 
+
+
+``` {r import 6, echo = TRUE}
+df_fun <- read.csv("gares-pianos.csv", sep = ";", 
+                    dec = ".", header = TRUE, stringsAsFactors = FALSE)
+```
+
+I follow the same clean-up process as before and check that it doesn't have doublons. That's what we've got at the end:
+
+```{r include=FALSE}
+df_fun <- df_fun[-nrow(df_fun),] #remove last empty one
+df_fun[,1] <- (df_fun[,1]-87000000)
+df_fun[,1] <- factor(df_fun[,1])
+df_fun <- df_fun[,-7]
+z <- df_fun %>%
+  group_by(UIC) %>%
+  summarize(count = n())
+
+z[which(z$count > 1),1] #no doublons
+```
+
+```{r}
+str(df_fun)
+```
+
+
+Finally, and most importantly, we import the number of people present at each train station:
+
+```{r import 9, echo=FALSE}
+df_freq <- read.csv("frequentation-gares.csv", sep = ";", 
+                   dec = ".", header = TRUE, stringsAsFactors = FALSE)
+df_freq <- df_freq[,c(2,5,6)]
+colnames(df_freq) <- c("UIC", "NumTrav", "NumNonTrav")
+df_freq[,1] <- (df_freq[,1]-87000000)
+df_freq[,1] <- factor(df_freq[,1])
+
+str(df_freq)
+
+```
+
+## Pivoting the data frame
+
+Next, we shorten up the column names and pivot the data frame:
+```{r pivot 1, echo=TRUE}
+df2 <- df1
+y <- colnames(df2)[7:24]
+df2[,ncol(df2)] <- factor(df2[,ncol(df2)], levels = c("Entrants", "Sortants"), labels = c("Ent", "Sort"))
+#make col names shorter for pivot column
+
+df3 <- pivot_wider(df2, names_from = Ent_Sort,
+            names_prefix = "", names_sep = "_", names_repair = "check_unique",
+            values_from = y, values_fill = NULL, values_fn = NULL)
+
+colnames(df2)
+colnames(df3)
+```
+
+We now add to the data add the number of people present in the station (counting both travelers and non-travelers):
+
+```{r echo = TRUE}
+df4 <- merge(df3, df_fun, by = "UIC", all.x = TRUE)
+df4 <- merge(df4, df_freq, by = "UIC", all.x = TRUE)
+df4$NumTotal <- df4$NumTrav+df4$NumNonTrav
+```
+
+Next, I add cleanliness data, using only entries for March. I do some final clean-up and save the data for the use next time:
+
+```{r echo = TRUE}
+y <- colnames(df4)
+z <- !(str_detect(y, "Sept")) #detect which columns have Sept in them and NOT this vector
+df5 <- df4[,z] #clean
+
+#remove ugly character in one of the factors
+levels(df5[,2]) <- c("CERA", "Centre Ouest", "DGGP", "Est", "Grand Sud","Manche Nord","Nelle Aquitaine")
+
+df6 <- merge(df5, df_prop_mars, by = "UIC", all.x=TRUE, all.y = FALSE)
+
+colnames(df6)[33] <- "Clean"
+colnames(df6)[5] <- "Station"
+df6 <- df6[,!colnames(df6) %in% c("Gare.y")] #remove this column by addressing it by name
+
+df_final <- df6
+save.image(file = "SNCF.RData")
+write.csv(df_final, "SNCF_all_data_mars.csv")
+```
+
+If you'd think that would be all, the cleaning job is only beginning.
+The database is a bit overcomplicated to run meaningful analysis on it. Also, the whole bunch of data for arriving passengers is missing. To deal with it, I write a custom function that averages the satisfaction ratings of arriving and departing passengers or takes one of these ratings if another one isn't available. Incidentally, I'm pretty sure there must be a readily available function to do it, but sometimes quickly drafting a fix is faster than looking for existing solution.
+
+```{r average_function, echo=TRUE}
+average_two_columns <- function(i, j) {
+for (i.seq in seq_along(1:nrow(df_final))){
+ x <- df_final[i.seq,i]
+ y <- df_final[i.seq,j]
+   vec1[i.seq] <- ifelse(is.na(y), ifelse(is.na(x), NA, x), (x+y)/2)
+}
+  return(unlist(vec1))
+}
+
+```
+
+I run it on the rating columns and include the other parameters into this new database:
+
+```{r, echo=TRUE}
+vec1 <- c(1,1,1,1)
+df <- df_final[,c(1,6)]
+df$Works <- as.numeric(as.character((df$Works)))
+df$P0 <- average_two_columns(11,12)
+df$P1 <- average_two_columns(9,10)
+df$P2 <- average_two_columns(13,14)
+df$P3 <- average_two_columns(15,16)
+df$P4 <- average_two_columns(17,18)
+df$P5 <- average_two_columns(23,24)
+df$P6 <- average_two_columns(19,20)
+df$P7 <- average_two_columns(21,22)
+df$Piano <- df_final[,25]
+df$PowStat <- df_final[,26]
+df$BabyFoot <- df_final[,27]
+df$Distr <- df_final[,28]
+df$People <- df_final[,31]
+df$Clean <- df_final$Clean
+df$Works <- df$Works
+str(df)
+```
+
+Finally, I scale the continuous variables and convert the factor levels into just three levels: 0's, 1's and NA's. This way, the presence of charging stations in the station is only represented as 'Yes', 'No' or 'We don't know', while the actual number of the charging stations (if there's some installed) is not important.
+
+```{r, eval = TRUE, include = FALSE}
+#to run
+dat <- df %>% mutate_each_(funs(scale(.) %>% as.vector), 
+                           vars=c("People","Clean"))
+
+dat$Piano[dat$Piano > 0] <- 1
+dat$PowStat[dat$PowStat > 0] <- 1
+dat$BabyFoot[dat$BabyFoot > 0] <- 1
+dat$Distr[dat$Distr > 0] <- 1
+dat$Works <- as.integer(as.character(dat$Works))
+dat$Works[dat$Works > 0] <- 1
+dat$Works <- factor(ifelse(is.na(dat$Works), "NA", dat$Works), levels = c("0", "1", "NA"))
+dat$Piano <- factor(ifelse(is.na(dat$Piano), "NA", dat$Piano), levels = c("0", "1", "NA"))
+dat$PowStat <- factor(ifelse(is.na(dat$PowStat), "NA", dat$PowStat), levels = c("0", "1", "NA"))
+dat$BabyFoot <- factor(ifelse(is.na(dat$BabyFoot), "NA", dat$BabyFoot), levels = c("0", "1", "NA"))
+dat$Distr <- factor(ifelse(is.na(dat$Distr), "NA", dat$Distr), levels = c("0", "1", "NA"))
+
+str(dat)
+```
+
+
+```{r, eval=FALSE, include = TRUE}
+dat <- df %>% mutate_each_(funs(scale(.) %>% as.vector), 
+                           vars=c("People","Clean"))
+
+dat$Piano[dat$Piano > 0] <- 1
+dat$PowStat[dat$PowStat > 0] <- 1
+dat$BabyFoot[dat$BabyFoot > 0] <- 1
+dat$Distr[dat$Distr > 0] <- 1
+dat$Works <- as.integer(as.character(dat$Works))
+dat$Works[dat$Works > 0] <- 1
+dat$Works <- factor(ifelse(is.na(dat$Works), "NA", dat$Works), levels = c("0", "1", "NA"))
+dat$Piano <- factor(ifelse(is.na(dat$Piano), "NA", dat$Piano), levels = c("0", "1", "NA"))
+dat$PowStat <- factor(ifelse(is.na(dat$PowStat), "NA", dat$PowStat), levels = c("0", "1", "NA"))
+dat$BabyFoot <- factor(ifelse(is.na(dat$BabyFoot), "NA", dat$BabyFoot), levels = c("0", "1", "NA"))
+dat$Distr <- factor(ifelse(is.na(dat$Distr), "NA", dat$Distr), levels = c("0", "1", "NA"))
+
+str(dat)
+```
+
+And the last but not least, I add the global satisfaction ratings to the dataframe and save both dataframes.
+
+```{r}
+df$Global <- rowMeans(cbind(df$P1, df$P2, df$P3, df$P4, df$P5))
+#Global satisfaction
+
+dat$Global <- df$Global
+
+str(dat)
+
+write.csv(df, "SNCF_data_mars_analysis_1.csv") 
+write.csv(dat, "SNCF_data_mars_analysis_2.csv") #standardized and factorized
+```
+
+## Exploratory Data Analysis
+
+At last, we're ready to have a look at the data.
+To begin with, let's have a glance at the crosspots generated using ggpairs function of GGally library:
+
+```{r plot GGally, eval=FALSE, include=FALSE}
+library(GGally)
+pm <- ggpairs(df[, 3:16])
+#, mapping = ggplot2::aes(color = df$Piano)) #if there is another factor column to color it
+
+for (i in 2:pm$nrow) {
+  for (j in 1:(i-1)) {
+    pm[i,j] = pm[i,j] + geom_smooth(method = "lm", se = FALSE)
+  }
+}
+pdf(file = "fig_SNCF_scatter_plot_matrix.pdf",
+    width = 8.5, height = 8.5)
+pm
+dev.off()
+```
+
+![SNCF trains station satisfaction scatterplot.](SNCF_scatterplot.png)
+
+The curious thing here is that all satisfaction ratings P0 - P7 are highly correlated. This is a well-known satisfaction survey phenomenon where the client is only capable of talking about his general satisfaction. This general satisfaction 'halo' leaves an impact on response to all the survey questions. Notice their beautiful normal distribution around general satisfaction.
+
+It's not straightforward to establish the relationship between survey answers and factor variables (like the presence of amenities) based on the plot alone, so we'll get to this later.
+
+Next thing to notice is that amenities like piano, power stations, magazine vending machines and foosball tables are highly correlated with amount of people in the station. It obviously reflects the managerial choice to install them in big city stations, and not in small town stations.
+
+Finally, notice that the distribution of the number of people looks very particular, all crammed to the left and with a long tail. The amount of people and the customer satisfaction is negatively correlated.
+
+
+```{r density, eval=FALSE, include=TRUE}
+ggplot(df, aes(x=People/1000000)) +
+  geom_histogram(aes(y =..density..), fill="lightskyblue2", color="skyblue4", bins = 8)+
+  geom_vline(aes(xintercept=mean(People/1000000)), color="grey39",
+             linetype="dashed")+
+  labs(title="Number of people in the station",x="People (million)", y = "Frequency")+
+  geom_density()+
+  theme_classic()
+```
+Let us now have a look at density function for amount of people at train stations and its probability distribution.
+
+![Density distribution for amount of people at the station.](Rplot_density.png){#id .class width=50% height=50%}
+![Cumulative for amount of people at the station.](Rplot_cumulative.png){#id .class width=50% height=50%}
+
+What these plots mean in simple words is that there's a very high amount of train stations with a small number of visitors, and a very few huge train stations, like Gare de Lyon in Paris. Even though it makes perfect sense, it is not a great distribution to work with, as ideally we would like a normal distribution for most common statistical methods to work. 
+
+```{r cumulative, eval=FALSE, include=TRUE}
+with(df, plot(sort(People/1000000), 
+                    (1:length(People))/length(People),
+                    type="s", ylim=c(0,1), las = 1, 
+                    xlab="Stations Ordered by People Presence (million)",
+                    ylab="Proportion of Stations with Lower Frequentation"))
+```
+
+For instance, the Normal Q-Q plot doesn't look like it should, and none of the common marketing transformations (logarithmic, square, square root, etc.) were able to do the trick.
+
+![Normal Q-Q plot for Amount of People at the station.](Rplot_QQ.png)
+
+By applying Box-Cox transformation with best &lambda; determined by using *car* package, we arrive at something nicer to look at, but still very far from normal distribution.
+
+```{r, eval=FALSE, include=TRUE}
+# ---------------------------------- Box-Cox Transform -------------------------
+powerTransform(df$People)
+lambda <- coef(powerTransform(1/df$People))
+df$People_BC <- bcPower(df$People, lambda)
+
+par(mfrow=c(1,2))
+hist(df$People,
+     xlab="Visitors", ylab="Count",
+     main="Original Distribution")
+hist(df$People_BC,
+     xlab="Box-Cox Transform of Visitors", ylab="Count",
+     main="Transformed Distribution")
+```
+
+
+![](Rplot_BC_trans.png)
+
+
+To examine the correlations in a much more comprehensible way, let's have a look at the correlation heat map:
+
+```{r heatcorr, eval=FALSE, include=TRUE}
+sel_vec <- c(2, 17, 11:16)
+sat_vec <- c(4:8,17, 11:16)
+
+library(polycor)
+library(corrplot) # for correlation plot, install if needed
+Cor <- hetcor(df[,sel_vec], ML = FALSE, std.err = TRUE,use="complete.obs", bins=4, pd=TRUE)
+
+corrplot.mixed(corr=Cor$correlations, upper = "ellipse", tl.pos ="lt")
+```
+
+![](Rplot_hetcorr_1.png)
+
+
+As a rule of thumb, in social sciences a correlation is considered significant if its absolute value is above 0.3 and rather strong when it's over 0.5.
+From this plot it is excruciatingly clear that *global satisfaction (Global) increases slightly with cleanliness*, but *decreases when there are power stations (PowStat) or magazine vending machines (Distr)*. That would be an unexpected finding. It is explained by the fact that the presence of these amenities is strongly correlated with large train stations with huge amounts of people. Apparently these stations are unpleasant, as we see a *strong negative correlation of global satisfaction and a number of people present*.
+
+![](Rplot_hetcorr_2.png)
+
+Let's have a look at variables explanations and see if they make sense:
+
+*P1 = Information Satisfaction*
+
+(I dropped the *P0* as it was collinear to P1
+
+  *P0 = I can easily ask for information about my train* )
+    
+*P2 = Movements inside the train station*
+
+*P3 = Cleanliness and safety*
+
+*P4 = Time spent in the station*
+
+(I also dropped *P6* and *P7* for the same reason, as they make part of P4:
+
+  *P6 = I feel good here*
+    
+  *P7 = I like the ambiance*)
+    
+*P5 = Services and shops*
+
+The curious observation is that *cleanliness rating as accessed by SNCF hardly depends on the "cleanliness and safety" perception of the visitors*. It's hardly surprising that the Global rating is correlated to the individual satisfaction ratings, as it was built as their average, but it's nevertheless amusing to see how individual ratings all depend one on each other, because of the overall satisfaction halo that we discussed earlier.
+The *number of train station visitors has a strong negative impact on each of the ratings*, except on the satisfaction with services and shops.
+
+## Preparing the model
+
+Let us now prepare the model.
+
+Firstly, we need to deal with the missing data. It is completely pointless to take into account the stations where the satisfaction survey responses aren't present. So we'll simply remove these entries. Not that I continue working with both dataframes, one with factors and another one with actual values, in order to see on which one the model performs better.
+
+```{r missing, eval=TRUE, include=TRUE}
+y <- is.na(df$Global)
+y <- !y
+df <- df[y,]
+dat <- dat[y,]
+```
+Next, I examine the rest of the missing values using *mice* and *VIM* libraries and complete the entries by generating imputed data using *cartesian* method for *df* and *pmm* for *dat* (the code for only one of these manipulations is shown):
+
+```{r mice, eval=FALSE, include=TRUE}
+library(mice)
+md.pattern(df)
+md.pattern(dat)
+
+library(VIM)
+mice_plot <- aggr(df, col=c('navyblue','yellow'),
+                  numbers=TRUE, sortVars=TRUE,
+                  labels=names(df), cex.axis=.7,
+                  gap=3, ylab=c("Missing data","Pattern"))
+
+imputed_Data1 <- mice(df, m=5, maxit = 50, method = 'cart', seed = 500)
+
+df <- complete(imputed_Data1,1)
+```
+
+```{r mice 2, eval=FALSE, include=FALSE}
+
+mice_plot <- aggr(dat, col=c('navyblue','yellow'),
+                  numbers=TRUE, sortVars=TRUE,
+                  labels=names(df), cex.axis=.7,
+                  gap=3, ylab=c("Missing data","Pattern"))
+
+imputed_Data <- mice(dat, m=5, maxit = 50, method = 'pmm', seed = 500)
+summary(imputed_Data)
+
+dat <- complete(imputed_Data,1)
+
+```
+
+![](Rplot_VIM.png)
+Let's check what we've got:
+
+```{r}
+summary(df)
+```
+
+Note that there are no more 'NA' values in *df* dataframe, but there are still in *dat* dataframe, as we encoded one of the factor levels to 'NA'.
+
+Note also that the data in *df* is not scaled, because the advantage of the linear regression is that it works with unscaled variables, unlike many other methods. 
+
+Before proceding to splitting the data into test and training subsets, let's make sure that it doesn't contain outliers:
+
+![](Rplot_outliers.png)
+
+We can't rely on the software highlighting the data as outliers, but have to use common sense. In our case, for instance, exceptionally high or low satisfaction ratings are most likely real, and the high number of visitors in the train station is, as well. I personally don't see outliers in this dataset.
+
+I then scale the continuous variables inf *df* and split the data using the train-and-test regimen of *caret* library, with 80% of the training data. I do this for both *df* and *dat* and check if there're any problems with partitions. As this is a straghtforward commonly repeated manipulation, I leave the code out.
+
+
+```{r eval = TRUE, include = FALSE}
+old_df <- df
+
+old_dat <- dat
+
+df <- select(df, c(2,11:17))
+df[,6] <- scale(df[,6]) 
+df[,7] <- scale(df[,7]) 
+df[,8] <- scale(df[,8]) 
+
+df <- cbind(old_df[,1], df)
+colnames(df)[1] <- "UIC"
+
+str(df)
+
+dat <- select(dat, c(1,2,11:17))
+dat[,9] <- scale(dat[,9])
+
+str(dat)
+```
+
+
+
+```{r save data, include = FALSE, eval = FALSE}
+str(df)
+str(dat)
+write.csv(df, "SNCF_df_final.csv")
+write.csv(dat, "SNCF_dat_final.csv")
+```
+
+```{r read data, include = FALSE, eval = TRUE}
+
+df <- read.csv("SNCF_df_final.csv", sep = ",", dec = ".")
+df <- df[,-1]
+df$UIC <- factor(df$UIC)
+str(df)
+
+dat <- read.csv("SNCF_dat_final.csv", sep = ",", dec = ".")
+dat <- dat[,-1]
+dat$UIC <- factor(dat$UIC)
+dat$Works <- factor(dat$Works, levels = c("0", "1"))
+dat$Piano <- factor(ifelse(is.na(dat$Piano), "NA", dat$Piano), levels = c("0", "1", "NA"))
+dat$PowStat <- factor(ifelse(is.na(dat$PowStat), "NA", dat$PowStat), levels = c("0", "1", "NA"))
+dat$BabyFoot <- factor(ifelse(is.na(dat$BabyFoot), "NA", dat$BabyFoot), levels = c("0", "1", "NA"))
+dat$Distr <- factor(ifelse(is.na(dat$Distr), "NA", dat$Distr), levels = c("0", "1", "NA"))
+
+str(dat)
+```
+
+
+```{r, include = FALSE}
+
+library(caret)
+set.seed(1234)
+training.samples_dat  <- createDataPartition(dat[,9], p = 0.8, list = FALSE)
+train_dat  <- dat[training.samples_dat, ]
+test_dat <- dat[-training.samples_dat, ]
+
+
+training.samples <- createDataPartition(df[,9], p = 0.8, list = FALSE)
+train  <- df[training.samples, ]
+test <- df[-training.samples, ]
+```
+
+## Model selection and training
+
+I explicitly specify all variables in regression model:
+
+```{r echo = TRUE, eval = TRUE}
+model1 <- {Global ~ Works + Piano + PowStat + BabyFoot + Distr + People + Clean}
+# fit linear regression model with scaled and factorized variables
+dat_fit <- lm(Global ~ Works + Piano + PowStat + BabyFoot + Distr + People + Clean, data = train_dat)
+```
+
+
+```{r echo=FALSE}
+pander(summary(dat_fit))
+```
+
+
+```{r echo = TRUE, eval = TRUE}
+# fit linear regression model with scaled and non-factor variables
+df_fit <- lm(Global ~ Works + Piano + PowStat + BabyFoot + Distr + People + Clean, data = train)
+```
+
+
+```{r echo=FALSE}
+pander(summary(df_fit))
+```
+
+
+It is fairly obvious that the model with continuous variables performs better in terms of certainty. The residuals are lower and the p-value is smaller. We therefore can choose to continue working with *df*, leaving *dat* aside.
+
+The significant variables, at the first glance, are People and Distr. We've already seen though all these are correlated, so a number of visitors alone might explain the satisfaction just as well.
+
+Let's check.
+
+```{r include=TRUE}
+df_simple <- lm(Global ~ People, data = train)
+```
+
+
+```{r echo=FALSE}
+pander(summary(df_simple))
+```
+
+This simple model is performing great. Residual standard error is barely higher than that of the more complex model. Isn't it actually surprising? 
+
+
+Let's have a look side-by-side:
+```{r echo=FALSE}
+tab_model(df_fit,df_simple, file="output.html")
+```
+
+```{r echo=FALSE}
+#supposedly need to include this line in text outside of the chunk:
+# htmltools::includeHTML("output.html")
+```
+
+
+Let's compare Akaike's Information Criterion and Bayesian information criterion for both models:
+
+```{r echo = FALSE, include = TRUE}
+cat("For df_fit:    AIC = ", AIC(df_fit), ", BIC = ", BIC(df_fit), 
+    "\nFor df_simple: AIC = ", AIC(df_simple), ", BIC = ", BIC(df_simple))
+```
+
+The smaller the values, the better the fit is. However, BIC is punishing the complexity of the model more severely. 
+
+Based on Mean Squared Error I would still lean towards the slightly more complex model, even though the difference is not huge:
+
+```{r include=FALSE}
+library(Metrics)
+```
+
+
+```{r echo=FALSE}
+cat("For df_fit:    RMSE = ", rmse(actual = train$Global, predicted = df_fit$fitted.values), 
+    "\nFor df_simple: RMSE = ", rmse(actual = train$Global, predicted = df_simple$fitted.values))
+```
+
+
+```{r echo=TRUE, results = 'hide'}
+#let's see if we can build a better model with interactions
+
+full_model <- {Global ~ (Works + Piano + PowStat + BabyFoot + Distr + People + Clean)^2}
+chosen_model_fit <- step(lm(full_model, data = train), direction ="backward")
+chosen_model_formula <- formula(chosen_model_fit)
+```
+
+```{r echo = FALSE}
+pander(summary(chosen_model_fit)) #P-value is smaller and it seems better overall
+```
+
+
+Based on the *anova* comparison of two models, there is significant difference between two.
+
+```{r echo=FALSE}
+pander(anova(df_fit, chosen_model_fit, test = "Chisq"))
+```
+
+## Checking assumptions of linear regression
+
+Let us first have a look at residuals for three models:
+```{r}
+par(mfrow=c(1,3),mar=c(4, 4, 2, 2))
+hist(df_fit$residuals, 
+     main = "df_fit model", xlab = "Residuals")
+hist(df_simple$residuals, 
+     main = "df_simple model", xlab = "Residuals")
+hist(chosen_model_fit$residuals, 
+     main = "chosen_model_fit model", xlab = "Residuals")
+```
+
+All three are normally distributed, as they should be if the fit is good.
+Let's have a look at Q-Q plots for all three:
+
+![Model quality plots for df_simple model](Rplot_QQ_simple.png)
+![Model quality plots for df_fit model](Rplot_QQ_fit.png)
+![Model quality plots for df_chosen_fit model](Rplot_QQ_chosen.png)
+
+We should also check the model for multicollinearity across explanatory variables and ensure that all values are low:
+```{r}
+print(vif(df_fit))
+```
+
+This obviously won't make sense for *chosen_model_fit*, as interactions between variables will have much higher value.
+
+![Residuals plots for df_simple model](Rplot_res_simple.png)
+![Residuals plots for df_fit model](Rplot_res_fit.png)
+![Residuals plots for df_chosen_fit model](Rplot_res_chosen.png)
+
+
+```{r include=FALSE}
+library(rsq)
+library(cvTools)
+```
+
+
+```{r echo=FALSE}
+
+r11 <- round(rsq(df_simple, adj = TRUE),3)
+r12 <- round(rsq(df_fit, adj = TRUE),3)
+r13 <- round(rsq(chosen_model_fit, adj = TRUE),3)
+
+#check on test set
+test_rsq <- function(model_name, data_name) {
+  predicted_sat <- predict(model_name, newdata = data_name)
+  actual_sat <- test$Global
+  
+  pred_act_reg <- as.data.frame(cbind(predicted_sat, test$Global))
+  colnames(pred_act_reg) <- c("pred", "act")
+  
+  res <- caret::postResample(pred_act_reg[,1], pred_act_reg[,2])
+  return(res[2])
+}
+
+
+r23 <- round(test_rsq(chosen_model_fit, test),3)
+r21 <- round(test_rsq(df_simple, test),3)
+r22 <- round(test_rsq(df_fit, test),3)
+
+
+
+# set up folds for cross-validation
+folds <- cvFolds(nrow(df), K = 5, R = 10)
+# set up function call for an MM regression model
+call3 <- call("lm", formula = chosen_model_formula)
+call2 <- call("lm", formula = model1)
+call1 <- call("lm", formula = Global ~ People)
+
+
+# perform cross-validation
+r31 <- round(mean(cvTool(call1, data = df, y = df$Global, cost = rtmspe, 
+                       folds = folds, costArgs = list(trim = 0.1))),3)
+
+r32 <- round(mean(cvTool(call2, data = df, y = df$Global, cost = rtmspe, 
+                       folds = folds, costArgs = list(trim = 0.1))),3)
+
+r33 <- round(mean(cvTool(call3, data = df, y = df$Global, cost = rtmspe, 
+                       folds = folds, costArgs = list(trim = 0.1))),3)
+
+#output is estimated prediction errors
+#root trimmed mean squared prediction error
+
+m <- data.frame(c(r11, r21, r31),
+                c(r12, r22, r32),
+                c(r13, r23, r33))
+colnames(m) <- c('df_simple', 'df_fit', 'chosen_model')
+rownames(m) <- c('Train RSQ', 'Test RSQ', 'Pred Error')
+pander(pandoc.table(m, keep.line.breaks = TRUE, style='grid'))
+
+```
+
+To summarize our findings, *customer satisfaction in SNCF train stations can be easily and quite accurately predicted based on the number of the train station visitors* (or simply put, train station size). The three models don't exhibit an extraordinary difference in prediction quality, and *the variables such as the presence or absence of the piano or vending machine doesn't play an important role*.
+
+Consequently, if the objective behind installing these facilities was improving customer satisfaction (and not, say, improving brand image or attracting more travelers), then the conclusion is that this is not serving its right purpose. Therefore, *this is an investment that could be spared*.
+
+Incidentally, the *cleanliness rating of the train station doesn't have a significant impact on customer satisfaction* either. Investing in additional personnel dedicated to this purpose is therefore not a recommendation I would suggest.
+
+
+    
